@@ -4,6 +4,311 @@ import {compileJSON, IO} from './util'
 import {Config} from './emitter'
 import { MathUtils } from 'three';
 
+
+//Textures
+class Texture {
+	constructor(data, uuid) {
+		var scope = this;
+		//Info
+		for (var key in Texture.properties) {
+			Texture.properties[key].reset(this);
+		}
+		//meta
+		this.source = ''
+		this.selected = false
+		this.multi_selected = false
+		this.show_icon = true
+		this.error = 0;
+		this.visible = true;
+		this.source_overwritten = false;
+		//Data
+		this.img = 0;
+		this.width = 0;
+		this.height = 0;
+		this.uv_width = Project ? Project.texture_width : 16;
+		this.uv_height = Project ? Project.texture_height : 16;
+		this.currentFrame = 0;
+		this.saved = true;
+		this.layers = [];
+		this.layers_enabled = false;
+		this.selected_layer = null;
+		this.internal = !isApp;
+		this.uuid = uuid || guid()
+		this.flags = new Set();
+
+		this._static = Object.freeze({
+			properties: {
+				selection: new IntMatrix(0, 0)
+			}
+		});
+
+		//Setup Img/Mat
+		this.canvas = document.createElement('canvas');
+		this.canvas.width = this.canvas.height = 16;
+		this.ctx = this.canvas.getContext('2d', {willReadFrequently: true});
+		let img = this.img = new Image()
+		img.src = 'assets/missing.png'
+
+		var tex = new THREE.Texture(this.canvas);
+		tex.magFilter = THREE.NearestFilter
+		tex.minFilter = THREE.NearestFilter
+		tex.name = this.name;
+		img.tex = tex;
+
+		var vertShader = `
+			attribute float highlight;
+
+			uniform bool SHADE;
+			uniform int LIGHTSIDE;
+
+			varying vec2 vUv;
+			varying float light;
+			varying float lift;
+
+			float AMBIENT = 0.5;
+			float XFAC = -0.15;
+			float ZFAC = 0.05;
+
+			void main()
+			{
+
+				if (SHADE) {
+
+					vec3 N = normalize( vec3( modelMatrix * vec4(normal, 0.0) ) );
+
+					if (LIGHTSIDE == 1) {
+						float temp = N.y;
+						N.y = N.z * -1.0;
+						N.z = temp;
+					}
+					if (LIGHTSIDE == 2) {
+						float temp = N.y;
+						N.y = N.x;
+						N.x = temp;
+					}
+					if (LIGHTSIDE == 3) {
+						N.y = N.y * -1.0;
+					}
+					if (LIGHTSIDE == 4) {
+						float temp = N.y;
+						N.y = N.z;
+						N.z = temp;
+					}
+					if (LIGHTSIDE == 5) {
+						float temp = N.y;
+						N.y = N.x * -1.0;
+						N.x = temp;
+					}
+
+					float yLight = (1.0+N.y) * 0.5;
+					light = yLight * (1.0-AMBIENT) + N.x*N.x * XFAC + N.z*N.z * ZFAC + AMBIENT;
+
+				} else {
+
+					light = 1.0;
+
+				}
+
+				if (highlight == 2.0) {
+					lift = 0.22;
+				} else if (highlight == 1.0) {
+					lift = 0.1;
+				} else {
+					lift = 0.0;
+				}
+				
+				vUv = uv;
+				vec4 mvPosition = modelViewMatrix * vec4( position, 1.0 );
+				gl_Position = projectionMatrix * mvPosition;
+			}`
+		var fragShader = `
+			#ifdef GL_ES
+			precision ${isApp ? 'highp' : 'mediump'} float;
+			#endif
+
+			uniform sampler2D map;
+
+			uniform bool SHADE;
+			uniform bool EMISSIVE;
+			uniform vec3 LIGHTCOLOR;
+
+			varying vec2 vUv;
+			varying float light;
+			varying float lift;
+
+			void main(void)
+			{
+				vec4 color = texture2D(map, vUv);
+				
+				if (color.a < 0.01) discard;
+
+				if (EMISSIVE == false) {
+
+					gl_FragColor = vec4(lift + color.rgb * light, color.a);
+					gl_FragColor.r = gl_FragColor.r * LIGHTCOLOR.r;
+					gl_FragColor.g = gl_FragColor.g * LIGHTCOLOR.g;
+					gl_FragColor.b = gl_FragColor.b * LIGHTCOLOR.b;
+
+				} else {
+
+					float light_r = (light * LIGHTCOLOR.r) + (1.0 - light * LIGHTCOLOR.r) * (1.0 - color.a);
+					float light_g = (light * LIGHTCOLOR.g) + (1.0 - light * LIGHTCOLOR.g) * (1.0 - color.a);
+					float light_b = (light * LIGHTCOLOR.b) + (1.0 - light * LIGHTCOLOR.b) * (1.0 - color.a);
+					gl_FragColor = vec4(lift + color.r * light_r, lift + color.g * light_g, lift + color.b * light_b, 1.0);
+
+				}
+
+				if (lift > 0.2) {
+					gl_FragColor.r = gl_FragColor.r * 0.6;
+					gl_FragColor.g = gl_FragColor.g * 0.7;
+				}
+			}`
+		var mat = new THREE.ShaderMaterial({
+			uniforms: {
+				map: {type: 't', value: tex},
+				SHADE: {type: 'bool', value: settings.shading.value},
+				LIGHTCOLOR: {type: 'vec3', value: new THREE.Color().copy(Canvas.global_light_color).multiplyScalar(settings.brightness.value / 50)},
+				LIGHTSIDE: {type: 'int', value: Canvas.global_light_side},
+				EMISSIVE: {type: 'bool', value: this.render_mode == 'emissive'}
+			},
+			vertexShader: vertShader,
+			fragmentShader: fragShader,
+			blending: this.render_mode == 'additive' ? THREE.AdditiveBlending : THREE.NormalBlending,
+			side: Canvas.getRenderSide(this),
+			transparent: true,
+		});
+		mat.map = tex;
+		mat.name = this.name;
+		Project.materials[this.uuid] = mat;
+
+		var size_control = {};
+
+		this.img.onload = () => {
+			tex.needsUpdate = true;
+			let dimensions_changed = scope.width !== img.naturalWidth || scope.height !== img.naturalHeight;
+			scope.width = img.naturalWidth;
+			scope.height = img.naturalHeight;
+			if (scope.selection) scope.selection.changeSize(scope.width, scope.height);
+			if (img.naturalWidth > 16384 || img.naturalHeight > 16384) {
+				scope.error = 2;
+			}
+			scope.currentFrame = Math.min(scope.currentFrame, (scope.frameCount||1)-1)
+
+			if (img.update_from_canvas) {
+				delete img.update_from_canvas;
+			} else if (!scope.layers_enabled) {
+				scope.canvas.width = scope.width;
+				scope.canvas.height = scope.height;
+				scope.ctx.drawImage(img, 0, 0);
+			}
+
+			if (this.flags.has('update_uv_size_from_resolution')) {
+				this.flags.delete('update_uv_size_from_resolution');
+				this.uv_width = scope.width;
+				this.uv_height = scope.display_height;
+			}
+
+			if (scope.isDefault) {
+				console.log('Successfully loaded '+scope.name+' from default pack')
+			}
+
+			let project = Texture.all.includes(scope) ? Project : ModelProject.all.find(project => project.textures.includes(scope));
+			if(!project) return;
+			project.whenNextOpen(() => {
+
+				if (Project.box_uv && Format.single_texture && !scope.error) {
+
+					if (!scope.keep_size) {
+						let pw = scope.getUVWidth();
+						let ph = scope.getUVHeight();
+						let nw = img.naturalWidth;
+						let nh = img.naturalHeight;
+
+						//texture is unlike project
+						var unlike = (pw != nw || ph != nh);
+						//Resolution of this texture has changed
+						var changed = size_control.old_width && (size_control.old_width != nw || size_control.old_height != nh);
+						//Resolution could be a multiple of project size
+						var multi = (
+							(pw%nw == 0 || nw%pw == 0) &&
+							(ph%nh == 0 || nh%ph == 0)
+						)
+
+						if (unlike && changed && !multi) {
+							Blockbench.showMessageBox({
+								translateKey: 'update_res',
+								icon: 'photo_size_select_small',
+								buttons: [tl('message.update_res.update'), tl('dialog.cancel')],
+								confirm: 0,
+								cancel: 1
+							}, function(result) {
+								if (result === 0) {
+									setProjectResolution(img.naturalWidth, img.naturalHeight)
+									if (selected.length) {
+										UVEditor.loadData()
+									}
+								}
+							})
+						}
+					}
+					delete scope.keep_size;
+					size_control.old_width = img.naturalWidth
+					size_control.old_height = img.naturalHeight
+				}
+
+				if (dimensions_changed) {
+					TextureAnimator.updateButton()
+					Canvas.updateAllFaces(scope)
+				}
+				if (typeof scope.load_callback === 'function') {
+					scope.load_callback(scope);
+					delete scope.load_callback;
+				}
+			})
+		}
+		this.img.onerror = (error) => {
+			if (isApp &&
+				!scope.isDefault &&
+				scope.mode !== 'bitmap' &&
+				scope.fromDefaultPack()
+			) {
+				return true;
+			} else {
+				scope.loadEmpty()
+			}
+		}
+
+		if (typeof data === 'object') {
+			this.extend(data);
+			if (this.layers_enabled) {
+				setTimeout(() => {
+					Project.whenNextOpen(() => {
+						this.updateLayerChanges()
+					})
+				}, 40);
+			}
+		}
+		if (!this.id) {
+			var i = Texture.all.length;
+			while (true) {
+				var c = 0
+				var duplicates = false;
+				while (c < Texture.all.length) {
+					if (Texture.all[c].id == i) {
+						duplicates = true;
+					}
+					c++;
+				}
+				if (duplicates === true) {
+					i++;
+				} else {
+					this.id = i.toString();
+					break;
+				}
+			}
+		}
+	}
+
 function processValue(v, type) {
 	if (type.type === 'molang') {
 		if (!isNaN(v)) {
@@ -79,7 +384,8 @@ function generateFile() {
 					texture: getValue('particle_texture_path') || 'textures/blocks/wool_colored_white'
 				}
 			}
-		}
+		},
+		texture: ''
 	}
 
 	//Curves
